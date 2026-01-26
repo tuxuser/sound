@@ -28,7 +28,7 @@ This firmware is for a Nuvoton ISD9160 Soundcorder chip (ARM Cortex-M0). The VPE
 ### VPE Header (0x8000)
 
 | Offset|  Size|  Value       | Description                                |
-| ------| ---- | ----------  -| ------------------------------------------ |
+| ------| ---- | -------------| ------------------------------------------ |
 | 0x00  |  4   |  FF AA 55 11 | Magic signature (custom)                   |
 | 0x04  |  2   |  80 00       | Version/flags                              |
 | 0x06  |  2   |  22 11       | Config                                     |
@@ -42,7 +42,7 @@ This firmware is for a Nuvoton ISD9160 Soundcorder chip (ARM Cortex-M0). The VPE
 ### Audio Index Table (0xBF34)
 
 | Offset | Size | Value       | Description                              |
-| ------ | ---- | ----------  | -----------------------------------------|
+| ------ | ---- | ----------- | -----------------------------------------|
 | 0x00   |    4 |45 50 56 CF  | Signature "EPV" + 0xCF                   |
 | 0x04   |    2 |      0C 00  | Unknown (12)                             |
 | 0x06   |    2 |      20 09  | Unknown (0x0920)                         |
