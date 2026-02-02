@@ -46,8 +46,8 @@ WORK_SIZE = 0x200
 
 
 # Hardcoded function adresses, specific to PHAT / Retail firmware
-FUNC_02C2 = 0x02C2
-FUNC_0626 = 0x0626
+FUNC_02C2 = 0x02C2 # minecraft: 0x02BA
+FUNC_0626 = 0x0626 # minecraft: 0x061E
 FUNC_804C = 0x804C
 FUNC_8092 = 0x8092
 
@@ -207,7 +207,7 @@ class ISD9160Emulator:
 
         # Initialize VPE decoder
         try:
-            self.call_function(0x804C, r0=header_addr, r1=work_addr)
+            self.call_function(FUNC_804C, r0=header_addr, r1=work_addr)
         except Exception as e:
             print(f"    VPE init failed: {e}")
             return [], sample_rate
