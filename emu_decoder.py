@@ -17,7 +17,7 @@ from typing import List, Tuple
 from unicorn import *
 from unicorn.arm_const import *
 
-from parser import FirmwareParser
+from parser import FirmwareParser, VPEHeader
 
 
 # Memory layout matching the firmware
@@ -45,14 +45,15 @@ WORK_BUF = SRAM_BASE + 0x100
 WORK_SIZE = 0x200
 
 
-# Hardcoded function addresses, specific to Minecraft firmware
 # (PHAT/Retail offsets are listed in comments for reference)
-FUNC_02C2 = 0x02BA  # PHAT/Retail: 0x02C2
-FUNC_0626 = 0x061E  # PHAT/Retail: 0x0626
-# VPE header pointers (0x8010+): init=0x801D, setup=0x804D, decode=0x8093
-#TODO: Verify via disassembly if these are responsible for VPE decoding
-FUNC_804C = 0x804C  # PHAT/Retail: 0x804C
-FUNC_8092 = 0x8092  # PHAT/Retail: 0x8092
+FUNC_02C2_PATTERN = b"\x10\xb5\x0b\x46\x93\x60"
+FUNC_02C2: int | None = None # PHAT/Retail: 0x02C2
+
+FUNC_0626_PATTERN = b"\x70\xb5\xc1\x64\x01\x79"
+FUNC_0626: int | None = None  # PHAT/Retail: 0x0626
+
+FUNC_804C: int | None = None  # PHAT/Retail: 0x804C
+FUNC_8092: int | None = None  # PHAT/Retail: 0x8092
 
 
 class ISD9160Emulator:
@@ -347,6 +348,12 @@ def save_wav(samples: List[int], output_path: Path, sample_rate: int = 16000):
     print(f"    Saved {len(samples)} samples ({duration:.2f}s), {nonzero} non-zero")
     return True
 
+def find_func_offsets(vpe_header: VPEHeader, fw_blob: bytes):
+    global FUNC_02C2, FUNC_02C2_PATTERN, FUNC_0626, FUNC_0626_PATTERN, FUNC_804C, FUNC_8092
+    FUNC_02C2 = fw_blob.index(FUNC_02C2_PATTERN)
+    FUNC_0626 = fw_blob.index(FUNC_0626_PATTERN)
+    FUNC_804C = vpe_header.func_setup
+    FUNC_8092 = vpe_header.func_decode
 
 def main() -> int:
     if len(sys.argv) < 2:
@@ -376,6 +383,12 @@ def main() -> int:
     parser = FirmwareParser(firmware_path)
     segments = parser.parse_segments()
     print()
+
+    # Gather function adresses from firmware dynamically
+    vpe_header = parser.parse_vpe_header()
+    with open(firmware_path, "rb") as f:
+        fw_blob = f.read()
+    find_func_offsets(vpe_header, fw_blob)
 
     # Initialize emulator
     emu = ISD9160Emulator(parser.firmware)
