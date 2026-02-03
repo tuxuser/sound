@@ -45,11 +45,14 @@ WORK_BUF = SRAM_BASE + 0x100
 WORK_SIZE = 0x200
 
 
-# Hardcoded function adresses, specific to PHAT / Retail firmware
-FUNC_02C2 = 0x02C2 # minecraft: 0x02BA
-FUNC_0626 = 0x0626 # minecraft: 0x061E
-FUNC_804C = 0x804C
-FUNC_8092 = 0x8092
+# Hardcoded function addresses, specific to Minecraft firmware
+# (PHAT/Retail offsets are listed in comments for reference)
+FUNC_02C2 = 0x02BA  # PHAT/Retail: 0x02C2
+FUNC_0626 = 0x061E  # PHAT/Retail: 0x0626
+# VPE header pointers (0x8010+): init=0x801D, setup=0x804D, decode=0x8093
+#TODO: Verify via disassembly if these are responsible for VPE decoding
+FUNC_804C = 0x804C  # PHAT/Retail: 0x804C
+FUNC_8092 = 0x8092  # PHAT/Retail: 0x8092
 
 
 class ISD9160Emulator:
@@ -171,77 +174,157 @@ class ISD9160Emulator:
         return all_samples, 16000
 
     def decode_vpe(self, data: bytes) -> Tuple[List[int], int]:
-        """Decode a VPE/Siren7 segment using firmware emulation."""
+        """Decode a VPE/Siren7 segment using firmware emulation.
+        
+        Based on cc_task analysis, VPE segments have this structure:
+        - Offset +0x00-0x03: codec byte and header
+        - Offset +0x04-0x0F:  init structure (read by decoder)
+        - Offset +0x10+: frame data stream
+        """
         self.setup()
+        
+        if len(data) < 0x20:
+            print(f"    VPE segment too small: {len(data)} bytes")
+            return [], 16000
 
-        # Write segment data
+        # Write segment data to extended memory
         data_addr = EXT_MEM_BASE
         self.uc.mem_write(data_addr, data)
-
-        # Parse VPE header (at offset 4 in segment)
-        header_addr = data_addr + 4
-        encoded_data_addr = data_addr + 16
-
-        header = data[4:20]
-        sample_rate = struct.unpack_from('<H', header, 0)[0]
-        bits_per_frame = struct.unpack_from('<H', header, 6)[0]
-        samples_per_frame = struct.unpack_from('<H', header, 10)[0]
-
-        if samples_per_frame == 0:
-            samples_per_frame = 320
-        if bits_per_frame == 0:
-            bits_per_frame = 80
-        if sample_rate == 0:
-            sample_rate = 4000
-
-        # Work buffer
-        work_addr = SRAM_BASE + 0x2000
-        self.uc.mem_write(work_addr, b'\x00' * 0x1000)
-
-        # Calculate frames
-        encoded_size = len(data) - 16
-        bytes_per_frame = (bits_per_frame + 7) // 8
-        if bytes_per_frame == 0:
-            bytes_per_frame = 10
-        num_frames = encoded_size // bytes_per_frame if bytes_per_frame > 0 else 1
-
-        # Initialize VPE decoder
+        
+        # Extract init structure embedded in segment at offset +4
+        init_struct_addr = data_addr + 4
+        frame_data_start = data_addr + 0x10
+        
+        # Allocate state buffer (needs ~0x800 bytes per buffer_setup analysis)
+        state_buf_addr = SRAM_BASE + 0x300
+        self.uc.mem_write(state_buf_addr, b'\x00' * 0x800)
+        
+        # Parse embedded init structure to understand parameters
+        # Based on firmware analysis and actual segment data:
+        # Offset +0: Often 48000 or 4000
+        # Offset +4: Sample rate discriminator value (compared against 7000 in decoder_init)
+        #            >= 7000 (like 14000) → 16kHz
+        #            < 7000 (like 7000 exactly or less) → 8kHz
+        init_bytes = data[4:16]
+        val_0 = struct.unpack_from('<H', init_bytes, 0)[0] if len(init_bytes) >= 2 else 0
+        val_4 = struct.unpack_from('<H', init_bytes, 4)[0] if len(init_bytes) >= 6 else 0
+        
+        # Determine sample rate based on value at offset +4
+        # decoder_init compares against UINT_00008160 = 0x1B58 = 7000
+        sample_rate = 16000 if val_4 > 7000 else 8000
+        
+        print(f"    VPE: Analyzing embedded init struct: val_0={val_0}, val_4={val_4} → {sample_rate}Hz")
+        
+        # Call buffer_setup to initialize state buffer
+        # Parameters per cc_task: r0=init_struct_ptr, r1=state_buffer
         try:
-            self.call_function(FUNC_804C, r0=header_addr, r1=work_addr)
+            self.call_function(FUNC_804C, r0=init_struct_addr, r1=state_buf_addr)
         except Exception as e:
-            print(f"    VPE init failed: {e}")
+            print(f"    VPE buffer_setup failed: {e}")
             return [], sample_rate
-
+        
+        # Read initialized state to determine samples_per_frame
+        # buffer_setup uses value at offset+10 of init struct
+        state_data = self.uc.mem_read(state_buf_addr, 0x20)
+        init_data = self.uc.mem_read(init_struct_addr, 16)
+        
+        # From decoder_init: samples_per_frame is at offset 10 of init structure
+        # It sets either 0x140 (320) or 0x280 (640) based on sample rate
+        if len(init_data) >= 12:
+            samples_per_frame = struct.unpack_from('<H', init_data, 10)[0]
+            if samples_per_frame == 0 or samples_per_frame > 1024:
+                samples_per_frame = 320  # Safe default
+        else:
+            samples_per_frame = 320
+        
+        # Calculate frame advance in bytes from cc_task algorithm
+        # Frame advance = ((val_at_offset_6 >> 4) * 2)
+        if len(init_data) >= 8:
+            val_6 = struct.unpack_from('<H', init_data, 6)[0]
+            frame_advance_bytes = ((val_6 >> 4) * 2)
+        else:
+            frame_advance_bytes = 120  # Default
+            
+        print(f"    VPE: samples_per_frame={samples_per_frame}, sample_rate={sample_rate}, frame_advance={frame_advance_bytes}B")
+        
         # Decode frames
+        # Frame data parsing is complex - the decode function reads variable-length frames
         all_samples = []
-        current_data = encoded_data_addr
-        volume = 0x2000
-
-        for frame_idx in range(num_frames):
-            output_addr = OUTPUT_BUF
-            self.uc.mem_write(output_addr, b'\x00' * (samples_per_frame * 2 + 64))
-
-            try:
-                sp = self.uc.reg_read(UC_ARM_REG_SP)
-                self.uc.mem_write(sp - 4, struct.pack('<I', volume))
-                self.uc.reg_write(UC_ARM_REG_SP, sp - 4)
-
-                self.call_function(FUNC_8092, r0=header_addr, r1=work_addr,
-                                   r2=current_data, r3=output_addr)
-
-                self.uc.reg_write(UC_ARM_REG_SP, sp)
-            except Exception as e:
-                print(f"    VPE frame {frame_idx} failed: {e}")
+        frame_count = 0
+        max_frames = 1000
+        
+        # Track current position in frame data
+        current_frame_ptr = frame_data_start
+        
+        for frame_idx in range(max_frames):
+            # Stop if we've reached end of segment
+            if current_frame_ptr >= data_addr + len(data):
                 break
-
-            # Read samples
-            output_data = self.uc.mem_read(output_addr, samples_per_frame * 2)
-            for i in range(0, samples_per_frame * 2, 2):
+            
+            # Output buffer for this frame
+            frame_output_addr = OUTPUT_BUF
+            self.uc.mem_write(frame_output_addr, b'\x00' * (samples_per_frame * 2 + 128))
+            
+            # Call decode_frame function (0x8093)
+            # Parameters from cc_task analysis:
+            # r0 = init_struct_addr (pointer to embedded init data)
+            # r1 = state_buf_addr (state/history buffer)
+            # r2 = frame_data_ptr (current position in frame stream - may be updated)
+            # r3 = output_buf_addr
+            # Stack param [SP+0]: gain/volume (0x2000 = unity gain)
+            
+            # We need to track where the frame pointer advances to
+            # Create a small structure to hold frame_ptr that decode can update
+            frame_ptr_holder = SRAM_BASE + 0x200
+            self.uc.mem_write(frame_ptr_holder, struct.pack('<I', current_frame_ptr))
+            
+            try:
+                # Stack: push volume parameter
+                stack_ptr = self.uc.reg_read(UC_ARM_REG_SP)
+                stack_ptr -= 4
+                self.uc.mem_write(stack_ptr, struct.pack('<I', 0x2000))  # Unity gain
+                self.uc.reg_write(UC_ARM_REG_SP, stack_ptr)
+                
+                result = self.call_function(FUNC_8092, 
+                                           r0=init_struct_addr,
+                                           r1=state_buf_addr,
+                                           r2=current_frame_ptr,
+                                           r3=frame_output_addr,
+                                           timeout=100000)
+                
+                # Restore stack
+                self.uc.reg_write(UC_ARM_REG_SP, stack_ptr + 4)
+                
+            except Exception as e:
+                print(f"    VPE frame {frame_idx} decode error: {e}")
+                break
+            
+            # Read decoded samples
+            output_data = self.uc.mem_read(frame_output_addr, samples_per_frame * 2)
+            frame_samples = []
+            for i in range(0, samples_per_frame *  2, 2):
                 sample = struct.unpack_from('<h', output_data, i)[0]
-                all_samples.append(sample)
-
-            current_data += bytes_per_frame
-
+                frame_samples.append(sample)
+            
+            # Check if frame has meaningful data
+            nonzero = sum(1 for s in frame_samples if s != 0)
+            if nonzero == 0 and frame_idx > 2:
+                # Stop if we get multiple empty frames
+                break
+                
+            all_samples.extend(frame_samples)
+            frame_count += 1
+            
+            # Advance frame pointer using the calculated frame size from init structure
+            # This is how cc_task advances: frame_advance = ((val_6 >> 4) * 2)
+            current_frame_ptr += frame_advance_bytes
+            
+            # Safety: stop at reasonable audio length
+            if len(all_samples) >= 160000:  # 10 seconds at 16kHz
+                break
+        
+        print(f"    VPE: Decoded {frame_count} frames, {len(all_samples)} samples total")
+        
         return all_samples, sample_rate
 
 
